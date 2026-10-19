@@ -21,6 +21,12 @@
 分类/首页/详情元数据走 275 官方接口, 播放走拾音盘 stream 直链;
 275 bookId 与拾音盘专辑 id 体系不同, 详情时按"书名+演播"自动匹配拾音盘专辑。
 
+详情提速 (对比上一版):
+- device_id 固定落盘 -> 跨启动同一 user_id, 已提取专辑直接命中歌单, 跳过 import 轮询;
+- 275->拾音盘 映射与专辑 platform_id 落盘 -> 重复打开直接拿曲目列表;
+- 轮询"先查后睡"(0.4s) 替代固定 sleep(1) x2, 去掉提取完成后的多余歌单回查;
+- 启动探活默认地址优先 (原分发地址已失效, 每次白等 3s 超时)。
+
 配置示例 (type=3):
 {
   "key": "tingshijie_t3", "name": "听书世界", "type": 3,
@@ -31,8 +37,10 @@
 """
 
 import json
+import os
 import re
 import sys
+import tempfile
 import time
 import uuid
 
@@ -61,6 +69,9 @@ TY = API + '/tingyou-app'
 PLAY_FLAG = '拾音盘'
 PAGE_SIZE = 120
 DEVICE_PREFIX = 'tvbox-tingshijie-'
+# 落盘缓存: 固定 device_id + 专辑映射, 让重复打开详情页走快路径
+CACHE_FILE = os.path.join(tempfile.gettempdir(), 'tvbox_tingshijie_cache.json')
+META_KEYS = ('id', 'title', 'cover_url', 'teller', 'author', 'count', 'description')
 
 CLASSES = [
     ('6', '玄幻奇幻'), ('7', '都市言情'), ('8', '宫斗女频'), ('9', '官场商战'),
@@ -86,9 +97,12 @@ class Spider(A):
         self._app = None
         self.base = DEFAULT_BASE
         self._uid = None
+        self._device_id = ''
         self._album_map = {}    # 275 bookId -> 拾音盘专辑 id
-        self._info_cache = {}   # 拾音盘专辑 id -> {platform_id,title,cover,desc,teller,tracks}
+        self._plat_map = {}     # 拾音盘专辑 id -> 平台歌单 id (已提取过)
+        self._info_cache = {}   # 拾音盘专辑 id -> {tracks,...} 进程内缓存
         self._ty_meta = {}      # 拾音盘专辑 id -> 搜索结果元数据 (标题兜底)
+        self._disk = None       # 落盘缓存 (懒加载)
 
     def getName(self):
         return self.name
@@ -105,39 +119,76 @@ class Spider(A):
             self.name = self.extend.get('name')
         self._boot()
 
-    # ==================== 启动 ====================
+    # ==================== 启动 / 落盘缓存 ====================
     def _boot(self):
         """懒启动: 即使运行时没调 init 也不会挂"""
         if self._app is None:
+            self._disk = self._loadDisk()
+            self._device_id = self._disk.get('device_id') or ''
+            self._album_map = dict(self._disk.get('album_map') or {})
+            self._plat_map = dict(self._disk.get('plat_map') or {})
+            self._ty_meta = dict(self._disk.get('meta') or {})
             self._app = N.Session()
             self._app.headers.update({'User-Agent': APP_UA, 'Content-Type': 'application/json'})
             self.base = self._resolveBase()
-            LOG('base = %s' % self.base)
+            LOG('base = %s (device=%s, 映射缓存 %d 条)'
+                % (self.base, self._device_id or 'new', len(self._album_map)))
+
+    @staticmethod
+    def _loadDisk():
+        try:
+            with open(CACHE_FILE, 'r', encoding='utf-8') as f:
+                d = json.load(f)
+            if isinstance(d, dict):
+                return d
+        except Exception:
+            pass
+        return {}
+
+    def _saveDisk(self):
+        try:
+            d = {
+                'device_id': self._device_id or '',
+                'album_map': self._album_map,
+                'plat_map': self._plat_map,
+                'meta': self._ty_meta,
+            }
+            tmp = CACHE_FILE + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(d, f, ensure_ascii=False)
+            os.replace(tmp, CACHE_FILE)
+        except Exception as e:
+            LOG('cache 落盘失败: %s' % e)
 
     def _resolveBase(self):
-        candidates = []
-        for u in CONFIG_URLS:
-            try:
-                text = N.get(u, timeout=3, headers={'User-Agent': UA}).text.strip()
-                if text and len(text) <= 200 and re.match(r'^https?://[^\s"\'<>]+$', text):
-                    candidates.append(text if text.endswith('/') else text + '/')
-            except Exception:
-                pass
-        candidates.append(DEFAULT_BASE)
-        for c in candidates:
+        def probe(c):
             try:
                 r = N.get(c + 'appHomeByCategory?categoryId=6&page=1&size=1',
                           timeout=4, headers={'User-Agent': UA})
-                if r.json().get('status') == 0:
-                    return c
+                return r.json().get('status') == 0
             except Exception:
-                continue
+                return False
+        # 默认地址直接探活; 分发服务器(常年失效)只在默认地址挂掉时才去查
+        if probe(DEFAULT_BASE):
+            return DEFAULT_BASE
+        for u in CONFIG_URLS:
+            try:
+                text = N.get(u, timeout=2, headers={'User-Agent': UA}).text.strip()
+                if text and len(text) <= 200 and re.match(r'^https?://[^\s"\'<>]+$', text):
+                    c = text if text.endswith('/') else text + '/'
+                    if probe(c):
+                        return c
+            except Exception:
+                pass
         return DEFAULT_BASE
 
     def _uidGet(self):
         if not self._uid:
+            if not self._device_id:  # 固定设备号: 跨启动同一账号, 已提取专辑直接命中
+                self._device_id = DEVICE_PREFIX + uuid.uuid4().hex[:12]
+                self._saveDisk()
             j = self._app.post(API + '/api/auth/device-login',
-                               json={'device_id': DEVICE_PREFIX + uuid.uuid4().hex[:12]},
+                               json={'device_id': self._device_id},
                                timeout=15).json()
             self._uid = j['data']['user_id']
         return self._uid
@@ -166,9 +217,15 @@ class Spider(A):
         r = self._app.get(TY + '/search', params={'keyword': keyword}, timeout=15)
         r.raise_for_status()
         items = (r.json().get('data') or {}).get('items') or []
+        added = False
         for it in items:
             if it.get('id'):
-                self._ty_meta[str(it['id'])] = it
+                k = str(it['id'])
+                if k not in self._ty_meta:
+                    added = True
+                self._ty_meta[k] = {x: it.get(x) for x in META_KEYS}
+        if added:
+            self._saveDisk()
         return items
 
     def _tyMatch(self, title, teller):
@@ -183,27 +240,33 @@ class Spider(A):
                 return it
         return items[0] if items else None
 
-    def _ensureAlbum(self, ty_id):
-        """返回 {platform_id, title, cover, desc, teller, tracks}, 带缓存"""
-        if ty_id in self._info_cache:
-            return self._info_cache[ty_id]
-        uid = self._uidGet()
-        plat, meta = None, {}
-        try:  # 已提取过的直接复用 (import 重复提交会再建一份歌单)
+    def _albumMeta(self, uid, ty_id):
+        """查用户歌单拿专辑元数据 (title/cover), 拿不到返回 {}"""
+        try:
             r = self._app.get(API + '/api/users/%d/albums' % uid, timeout=15).json()
             for a in r.get('data') or []:
                 if str(a.get('external_id')) == str(ty_id):
-                    plat = a.get('id')
-                    meta = a
-                    break
+                    return a
         except Exception as e:
             LOG('用户歌单查询失败: %s' % e)
-        if plat is None:  # 提交提取任务
-            r = self._app.post(TY + '/import', json={'user_id': uid, 'album_id': str(ty_id)},
+        return {}
+
+    def _ensureAlbum(self, ty_id, _retried=False):
+        """返回 {platform_id, title, cover, desc, teller, tracks}, 带缓存"""
+        ty_id = str(ty_id)
+        if ty_id in self._info_cache:
+            return self._info_cache[ty_id]
+        uid = self._uidGet()
+        meta = {}
+        plat = self._plat_map.get(ty_id)   # 落盘快路径: 该专辑已提取过
+        if plat is None:                   # 兜底: 从歌单里找 (老缓存/别处提取的)
+            meta = self._albumMeta(uid, ty_id)
+            plat = meta.get('id')
+        if plat is None:                   # 提交提取任务
+            r = self._app.post(TY + '/import', json={'user_id': uid, 'album_id': ty_id},
                                timeout=30)
             task = (r.json().get('data') or {}).get('task_id')
-            for _ in range(15):  # 热门书命中服务端克隆缓存秒回, 新书需等服务端抓取
-                time.sleep(1)
+            for i in range(30):            # 先查后睡: 热门书克隆缓存常秒回
                 st = self._app.get(TY + '/import/status', params={'task_id': task},
                                    timeout=15).json().get('data') or {}
                 if st.get('status') == 'done':
@@ -211,32 +274,36 @@ class Spider(A):
                     break
                 if st.get('status') == 'failed':
                     break
+                time.sleep(0.4 if i < 8 else 1)
             if plat is None:
                 raise RuntimeError('提取未完成, 稍后重试')
-            time.sleep(1)
-            try:
-                r = self._app.get(API + '/api/users/%d/albums' % uid, timeout=15).json()
-                for a in r.get('data') or []:
-                    if str(a.get('external_id')) == str(ty_id):
-                        meta = a
-                        break
-            except Exception:
-                pass
+            self._plat_map[ty_id] = plat
+            self._saveDisk()
+        if not meta and ty_id not in self._ty_meta:
+            meta = self._albumMeta(uid, ty_id)  # 仅缺元数据时才回查 (历史记录直开)
         r = self._app.get(API + '/api/albums/%s/tracks' % plat, params={'user_id': uid},
                           timeout=20).json()
         tracks = r.get('data') or []
         if not isinstance(tracks, list):
             tracks = tracks.get('tracks') or tracks.get('list') or []
-        cached = self._ty_meta.get(str(ty_id)) or {}
+        if not tracks and not _retried:
+            # 盘缓存的 plat 失效 (服务端重建歌单等): 重置缓存重新提取一次
+            LOG('曲目为空, 重置提取缓存重试: %s' % ty_id)
+            self._plat_map.pop(ty_id, None)
+            self._info_cache.pop(ty_id, None)
+            self._saveDisk()
+            return self._ensureAlbum(ty_id, _retried=True)
+        cached = self._ty_meta.get(ty_id) or {}
         info = {
-            'platform_id': plat, 'ty_id': str(ty_id),
+            'platform_id': plat, 'ty_id': ty_id,
             'title': meta.get('title') or cached.get('title') or '',
             'cover': meta.get('cover_url') or cached.get('cover_url') or '',
-            'desc': meta.get('description') or '',
+            'desc': meta.get('description') or cached.get('description') or '',
             'teller': cached.get('teller') or '',
             'tracks': tracks,
         }
-        self._info_cache[ty_id] = info
+        if tracks:  # 空曲目不落缓存 (服务端还没抓好时, 下次进来还能再试)
+            self._info_cache[ty_id] = info
         return info
 
     def _bookToAlbum(self, bid):
@@ -252,6 +319,7 @@ class Spider(A):
             return None
         ty_id = str(hit['id'])
         self._album_map[bid] = ty_id
+        self._saveDisk()
         info = self._ensureAlbum(ty_id)
         # 275 侧的书名/封面/简介更干净, 优先使用
         info['title'] = book.get('bookTitle') or info['title']
@@ -295,6 +363,7 @@ class Spider(A):
     def detailContent(self, did):
         raw = str(did[0]).strip()
         S = {'list': [], 'parse': 0, 'jx': 0}
+        t0 = time.time()
         try:
             self._boot()
             if raw.startswith('ty_'):
@@ -317,8 +386,9 @@ class Spider(A):
                 'vod_play_from': PLAY_FLAG,
                 'vod_play_url': '#'.join(eps),
             })
+            LOG('detail %s: %d集 %.2fs' % (raw, len(eps), time.time() - t0))
         except Exception as e:
-            LOG('detailContent 失败 [%s]: %s' % (raw, e))
+            LOG('detailContent 失败 [%s] %.2fs: %s' % (raw, time.time() - t0, e))
         return S
 
     def searchContent(self, key, quick, page='1'):
@@ -355,7 +425,6 @@ class Spider(A):
                 LOG('playerContent 校验失败 http=%s ct=%s' % (r.status_code, ct))
         except Exception as e:
             LOG('playerContent 失败 [%s]: %s' % (pid, e))
-            S['url'] = '' if not self.error_play_url else ''
         return S
 
     def localProxy(self, params):
