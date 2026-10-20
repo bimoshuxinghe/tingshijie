@@ -35,6 +35,17 @@
 - detailContent 整体重试 2 轮;
 - playerContent 不再探活 (探活抖动=空url="暂无播放数据"), 直接给拼好的直链。
 
+- 拾音盘搜索没有 TME 独家书 (我弟是神棍/盗墓笔记/雨村笔记/祖祀/重启之极海听雷等
+  演播方为 TME有声剧场 的书全部 0 结果), 原逻辑匹配失败 -> 详情页空;
+- 现在匹配不到/提取失败/曲目为空时, 自动改走 275 官方章节接口
+  chapter?size=1000&page=&sort=asc&bookId= 拉真实选集;
+- 播放走 AppGetChapterUrl (老接口, xmcdn 源, 实测 12/12 全成功), 需 timeStamp+盐
+  双重 md5 签名 addItParapet (签名缺失服务端回 data:null); AppGetChapterUrl2023
+  (自家 audio.tingshijie.com 源) 常年 status:1 只当备用;
+  音频 CDN 拦截官方 UA (Access Denied: Please use the official App),
+  播放 header 用 okhttp UA 即可, 支持 Range 拖动;
+- 搜索同步合并 275 appSearch (需 app_token=abcSEARCH-2025), 拾音盘搜不到的书也能搜。
+
 配置示例 (hipy-server T4):
 {
   "key": "hipy_tingshijie", "name": "听书世界", "type": 4,
@@ -44,6 +55,7 @@
 可选 ext: {"name":"自定义源名"} —— 不传则用默认名。
 """
 
+import hashlib
 import json
 import os
 import re
@@ -75,6 +87,11 @@ CONFIG_URLS = ['http://101.43.48.231:8090/config/tingchina2025.txt']
 API = 'https://api.365ting.com'
 TY = API + '/tingyou-app'
 PLAY_FLAG = '拾音盘'
+NATIVE_FLAG = '275听书'
+# AppGetChapterUrl2023 签名盐 (逆向自 java 版)
+SIGN_KEY = 'J9gSpfUlzYxE8Hn5IXiGaD2jVMrwAm0K'
+SEARCH_TOKEN = 'abcSEARCH-2025'
+SRC_TTL = 300  # 275 播放地址缓存时长 (auth_key 实测过期后仍可播, 5 分钟很安全)
 PAGE_SIZE = 120
 DEVICE_PREFIX = 'tvbox-tingshijie-'
 # 落盘缓存: 固定 device_id + 专辑映射, 让重复打开详情页走快路径
@@ -95,6 +112,10 @@ def LOG(msg):
         pass
 
 
+def _md5(s):
+    return hashlib.md5(s.encode('utf-8')).hexdigest()
+
+
 class Spider(A):
 
     def __init__(self):
@@ -110,6 +131,10 @@ class Spider(A):
         self._plat_map = {}     # 拾音盘专辑 id -> 平台歌单 id (已提取过)
         self._info_cache = {}   # 拾音盘专辑 id -> {tracks,...} 进程内缓存
         self._ty_meta = {}      # 拾音盘专辑 id -> 搜索结果元数据 (标题兜底)
+        self._src_cache = {}    # 275 播放地址短期缓存 (键 -> (url, 时间))
+        self._book_cache = {}   # 275 bookId -> bookData (进程内, 重复打开秒出)
+        self._chap_cache = {}   # 275 bookId -> (chapters, total)
+        self._ty_miss = set()   # 拾音盘确认没这本书的 bookId (本会话不再白搜)
         self._disk = None       # 落盘缓存 (懒加载)
 
     def getName(self):
@@ -263,16 +288,24 @@ class Spider(A):
         return items
 
     def _tyMatch(self, title, teller):
+        """标题真正对得上才认; 对不上返回 None 走 275 原生兜底。
+        不再拿 items[0] 硬凑 —— 否则 TME 独家书会错绑到别的演播版本。"""
         items = self._tySearch(title or '') or []
         title = re.sub(r'\s+', '', title or '')
-        for it in items:  # 演播者匹配优先
-            if teller and teller in (it.get('teller') or ''):
-                return it
-        for it in items:  # 标题匹配
+        if not title or not items:
+            return None
+
+        def ok(it):
             t = re.sub(r'\s+', '', it.get('title') or '')
-            if t.startswith(title) or title in t:
+            return bool(t) and (t.startswith(title) or title in t or t in title)
+
+        for it in items:  # 标题+演播都对上最优先
+            if ok(it) and teller and teller in (it.get('teller') or ''):
                 return it
-        return items[0] if items else None
+        for it in items:  # 标题对上即可
+            if ok(it):
+                return it
+        return None
 
     def _albumMeta(self, uid, ty_id):
         """查用户歌单拿专辑元数据 (title/cover), 拿不到返回 {}"""
@@ -381,27 +414,103 @@ class Spider(A):
             self._info_cache[ty_id] = info
         return info
 
+    # ==================== 275 原生兜底 (拾音盘没有的书) ====================
+    def _bookData(self, bid):
+        if bid in self._book_cache:
+            return self._book_cache[bid]
+        try:
+            data = (self._api275('book?bookId=' + bid).get('data') or {}).get('bookData') or {}
+        except Exception as e:
+            LOG('275 book 获取失败: %s' % e)
+            return {}
+        if data:
+            if len(self._book_cache) > 32:
+                self._book_cache.clear()
+            self._book_cache[bid] = data
+        return data
+
+    def _bookChapters(self, bid, max_pages=8):
+        """275 官方章节列表 -> (章节列表, 总数)"""
+        if bid in self._chap_cache:
+            return self._chap_cache[bid]
+        out, page, total = [], 1, 0
+        while page <= max_pages:
+            d = self._api275('chapter?size=1000&page=%d&sort=asc&bookId=%s' % (page, bid),
+                             timeout=20).get('data') or {}
+            lst = d.get('list') or []
+            out.extend(lst)
+            total = int(d.get('count') or 0)
+            if not lst or len(out) >= total or len(lst) < 1000:
+                break
+            page += 1
+        if out:
+            if len(self._chap_cache) > 8:   # 章节列表大, 少存点
+                self._chap_cache.clear()
+            self._chap_cache[bid] = (out, total)
+        return out, total
+
+    def _bookNative(self, bid, book):
+        """拾音盘拿不到时用 275 原生章节造详情 (TME 独家书也能出选集)"""
+        try:
+            chapters, total = self._bookChapters(bid)
+        except Exception as e:
+            LOG('275 章节获取失败 [%s]: %s' % (bid, e))
+            return None
+        if not chapters:
+            LOG('275 章节为空: %s' % bid)
+            return None
+        return {
+            'native': True, 'bid': str(bid), 'ty_id': '', 'platform_id': '',
+            'title': book.get('bookTitle') or '',
+            'cover': book.get('bookImage') or '',
+            'desc': book.get('bookDesc') or '',
+            'teller': book.get('bookAnchor') or '',
+            'count': total or len(chapters),
+            'tracks': [], 'chapters': chapters,
+        }
+
     def _bookToAlbum(self, bid):
+        """拾音盘优先; 搜不到/提取失败/曲目为空 -> 275 原生章节兜底, 详情永不出空"""
+        book = self._bookData(bid)
+        info = None
         if bid in self._album_map:
-            return self._ensureAlbum(self._album_map[bid])
-        book = self._api275('book?bookId=' + bid).get('data', {}).get('bookData', {})
-        if not book or not book.get('bookTitle'):
+            try:  # 已有映射: 书名拿不到也不影响播放
+                info = self._ensureAlbum(self._album_map[bid])
+            except Exception as e:
+                LOG('拾音盘缓存专辑失败, 转275原生: %s' % e)
+        elif book.get('bookTitle'):
+            hit = None
+            if bid in self._ty_miss:      # 会话内已确认拾音盘没有, 直接走原生
+                LOG('拾音盘已知无此书, 走275原生: %s' % book.get('bookTitle'))
+            else:
+                hit = self._tyMatch(book.get('bookTitle', ''), book.get('bookAnchor') or '')
+                if hit:
+                    ty_id = str(hit['id'])
+                    self._album_map[bid] = ty_id
+                    self._saveDisk()
+                    try:
+                        info = self._ensureAlbum(ty_id)
+                    except Exception as e:
+                        LOG('拾音盘提取失败, 转275原生: %s' % e)
+                else:
+                    self._ty_miss.add(bid)
+                    LOG('拾音盘未匹配到专辑, 走275原生: %s' % book.get('bookTitle'))
+        if info and info.get('tracks'):
+            # 275 侧的书名/封面/简介更干净, 优先使用
+            info['title'] = book.get('bookTitle') or info['title']
+            info['cover'] = book.get('bookImage') or info['cover']
+            info['desc'] = book.get('bookDesc') or info['desc']
+            info['teller'] = book.get('bookAnchor') or info.get('teller') or ''
+            return info
+        if info:
+            LOG('拾音盘曲目为空, 转275原生: %s' % book.get('bookTitle'))
+        if not book.get('bookTitle'):
             LOG('275 book 无数据: %s' % bid)
-            return None
-        hit = self._tyMatch(book.get('bookTitle', ''), book.get('bookAnchor') or '')
-        if not hit:
-            LOG('拾音盘未匹配到专辑: %s' % book.get('bookTitle'))
-            return None
-        ty_id = str(hit['id'])
-        self._album_map[bid] = ty_id
-        self._saveDisk()
-        info = self._ensureAlbum(ty_id)
-        # 275 侧的书名/封面/简介更干净, 优先使用
-        info['title'] = book.get('bookTitle') or info['title']
-        info['cover'] = book.get('bookImage') or info['cover']
-        info['desc'] = book.get('bookDesc') or info['desc']
-        info['teller'] = book.get('bookAnchor') or ''
-        return info
+            return info
+        native = self._bookNative(bid, book)
+        if native:
+            return native
+        return info  # 原生也拿不到才退回按集数合成
 
     # ==================== 模板接口 ====================
     def homeContent(self, filter):
@@ -437,27 +546,40 @@ class Spider(A):
 
     @staticmethod
     def _buildVod(raw, info):
-        """tracks 可用时用真实标题; 拿不到时按元数据集数合成选集 (详情页永不出空)"""
-        ty_id = info['ty_id']
-        tracks = info.get('tracks') or []
-        eps = []
-        if tracks:
-            for i, t in enumerate(tracks):
-                idx = t.get('track_no') or i + 1
-                eps.append('%s$%s|%s' % (t.get('title') or ('第%d集' % idx), ty_id, idx))
-        else:
-            count = int(info.get('count') or 0)
-            if count <= 0:
+        """三路出选集: 拾音盘 tracks / 275 原生章节 / 按集数合成 (详情永不出空)"""
+        eps, flag = [], PLAY_FLAG
+        if info.get('native'):
+            bid = info['bid']
+            for i, ch in enumerate(info.get('chapters') or []):
+                cid = ch.get('chapterId') or ch.get('url')
+                if not cid:
+                    continue
+                name = re.sub(r'[#$]', ' ', ch.get('title') or '') or ('第%d集' % (i + 1))
+                eps.append('%s$275|%s|%s' % (name, bid, cid))
+            if not eps:
                 return None
-            LOG('曲目列表不可用, 按集数合成选集兜底: %s x%d' % (ty_id, count))
-            eps = ['第%d集$%s|%d' % (n, ty_id, n) for n in range(1, count + 1)]
+            flag = NATIVE_FLAG
+        else:
+            ty_id = info['ty_id']
+            tracks = info.get('tracks') or []
+            if tracks:
+                for i, t in enumerate(tracks):
+                    idx = t.get('track_no') or i + 1
+                    name = re.sub(r'[#$]', ' ', t.get('title') or '') or ('第%d集' % idx)
+                    eps.append('%s$%s|%s' % (name, ty_id, idx))
+            else:
+                count = int(info.get('count') or 0)
+                if count <= 0:
+                    return None
+                LOG('曲目列表不可用, 按集数合成选集兜底: %s x%d' % (ty_id, count))
+                eps = ['第%d集$%s|%d' % (n, ty_id, n) for n in range(1, count + 1)]
         return {
             'vod_id': raw,
             'vod_name': info.get('title') or '',
             'vod_pic': info.get('cover') or '',
             'vod_remarks': info.get('teller') or '',
             'vod_content': info.get('desc') or '',
-            'vod_play_from': PLAY_FLAG,
+            'vod_play_from': flag,
             'vod_play_url': '#'.join(eps),
         }
 
@@ -492,27 +614,86 @@ class Spider(A):
              'parse': 0, 'jx': 0}
         try:
             self._boot()
+            seen = set()
             for it in self._tySearch(key) or []:
+                name = it.get('title') or ''
+                seen.add(re.sub(r'\s+', '', name))
                 S['list'].append({
                     'vod_id': 'ty_' + str(it.get('id') or ''),
-                    'vod_name': it.get('title') or '',
+                    'vod_name': name,
                     'vod_pic': it.get('cover_url') or '',
                     'vod_remarks': '%s·%s集' % (it.get('teller') or it.get('author') or '',
                                                 it.get('count') or '?'),
                 })
+            # 275 官方搜索: 拾音盘没有的书 (TME 独家等) 也能搜到
+            try:
+                j = self._json('GET', self.base + 'appSearch',
+                               params={'client': 'babala-android', 'search': key,
+                                       'app_token': SEARCH_TOKEN},
+                               headers={'User-Agent': UA}, timeout=15)
+                for x in (j.get('data') or {}).get('bookData') or []:
+                    name = x.get('bookTitle') or ''
+                    k = re.sub(r'\s+', '', name)
+                    if not k or k in seen:
+                        continue
+                    seen.add(k)
+                    S['list'].append({
+                        'vod_id': '275_' + str(x.get('id') or ''),
+                        'vod_name': name,
+                        'vod_pic': x.get('bookImage') or '',
+                        'vod_remarks': x.get('bookAnchor') or '',
+                    })
+            except Exception as e:
+                LOG('275 搜索失败(忽略): %s' % e)
             S['total'] = len(S['list'])
         except Exception as e:
             LOG('searchContent 失败 [%s]: %s' % (key, e))
         return S
 
+    def _nativeSrc(self, bid, cid):
+        """275 原生播放地址: timeStamp+盐 双重 md5 签名 (缺签名服务端回 data:null)。
+        主用老接口 AppGetChapterUrl (xmcdn 源, 实测 12/12 稳定);
+        AppGetChapterUrl2023 (自家 audio.tingshijie.com 源) 经常 status:1
+        "分集地址解析失败", 只当备用。拿到后短期缓存, 复播不再打接口。"""
+        key = '%s|%s' % (bid, cid)
+        c = self._src_cache.get(key)
+        if c and time.time() - c[1] < SRC_TTL:
+            return c[0]
+        for i in range(3):
+            for path in ('AppGetChapterUrl', 'AppGetChapterUrl2023'):
+                try:
+                    ts = str(int(time.time() * 1000))
+                    sign = _md5(_md5(ts + SIGN_KEY) + SIGN_KEY)
+                    j = self._json('GET', self.base + path,
+                                   params={'timeStamp': ts, 'uid': '', 'chapterId': cid,
+                                           'addItParapet': sign, 'bookId': bid},
+                                   headers={'User-Agent': APP_UA}, tries=2, timeout=10)
+                    src = j.get('src')
+                    if src:
+                        self._src_cache[key] = (src, time.time())
+                        if len(self._src_cache) > 64:
+                            self._src_cache.clear()
+                        return src
+                    LOG('275 播放地址为空[%s]: %s/%s %s' % (path[-4:], bid, cid, str(j)[:70]))
+                except Exception as e:
+                    LOG('275 播放地址获取异常[%s]: %s' % (path[-4:], e))
+            time.sleep(1.0 * (i + 1))   # 抖动/频控冷却
+        return ''
+
     def playerContent(self, flag, pid, vipFlags):
         # 直链由 album+idx 规则拼出, 不做探活: 探活请求一旦抖动就返回空 url,
-        # 播放器必然报"暂无播放数据" —— 交给播放器自己拉流即可
+        # 播放器必然报"暂无播放数据" —— 交给播放器自己拉流即可。
+        # header 用 okhttp UA: audio.tingshijie.com 会拦截官方 UA
+        # (Access Denied: Please use the official App), okhttp/浏览器 UA 放行
         S = {'parse': 0, 'jx': 0, 'playUrl': '', 'url': '', 'header': {'User-Agent': APP_UA}}
         try:
-            ty_id, idx = str(pid).split('|', 1)
-            if ty_id and str(idx).isdigit():
-                S['url'] = '%s/tingyou/stream?album=%s&idx=%s' % (API, ty_id, idx)
+            parts = str(pid).split('|')
+            if len(parts) == 3 and parts[0] == '275':        # 275 原生章节
+                S['url'] = self._nativeSrc(parts[1], parts[2])
+                if not S['url']:
+                    LOG('playerContent 275 播放地址获取失败: %s' % pid)
+            elif len(parts) == 2 and parts[1].isdigit():     # 拾音盘直链
+                S['url'] = '%s/tingyou/stream?album=%s&idx=%s' % (API, parts[0], parts[1])
             else:
                 LOG('playerContent 参数异常: %s' % pid)
         except Exception as e:
