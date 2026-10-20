@@ -27,6 +27,14 @@
 - 轮询"先查后睡"(0.4s) 替代固定 sleep(1) x2, 去掉提取完成后的多余歌单回查;
 - 启动探活默认地址优先 (原分发地址已失效, 每次白等 3s 超时)。
 
+稳健性 (修"偶发选集/暂无播放数据"):
+- 所有请求走 _req: 网络抖动/超时/429/5xx 退避重试 3 次;
+- 提取轮询单次异常只记日志不中断, 整个提取失败再提交一轮;
+- 曲目列表瞬时异常/空列表重试 3 次, 仍空则重置 plat 重新提取 1 次;
+- 曲目彻底拿不到时按元数据集数合成选集 (第N集), 详情页永不出空;
+- detailContent 整体重试 2 轮;
+- playerContent 不再探活 (探活抖动=空url="暂无播放数据"), 直接给拼好的直链。
+
 配置示例 (type=3):
 {
   "key": "tingshijie_t3", "name": "听书世界", "type": 3,
@@ -182,22 +190,49 @@ class Spider(A):
                 pass
         return DEFAULT_BASE
 
+    # ==================== 带重试的 HTTP (详情页健壮性核心) ====================
+    def _req(self, method, url, tries=3, **kw):
+        """网络抖动/超时/429/5xx 自动退避重试, 全部失败才抛异常"""
+        kw.setdefault('timeout', 15)
+        last = None
+        for i in range(tries):
+            try:
+                r = self._app.request(method, url, **kw)
+                if r.status_code in (429, 500, 502, 503, 504) and i < tries - 1:
+                    last = RuntimeError('HTTP %d' % r.status_code)
+                    time.sleep(0.6 * (i + 1))
+                    continue
+                r.raise_for_status()
+                return r
+            except Exception as e:
+                last = e
+                time.sleep(0.6 * (i + 1))
+        raise last
+
+    def _json(self, method, url, **kw):
+        r = self._req(method, url, **kw)
+        try:
+            return r.json()
+        except Exception:
+            raise RuntimeError('响应非 JSON: %s' % url)
+
     def _uidGet(self):
         if not self._uid:
             if not self._device_id:  # 固定设备号: 跨启动同一账号, 已提取专辑直接命中
                 self._device_id = DEVICE_PREFIX + uuid.uuid4().hex[:12]
                 self._saveDisk()
-            j = self._app.post(API + '/api/auth/device-login',
-                               json={'device_id': self._device_id},
-                               timeout=15).json()
-            self._uid = j['data']['user_id']
+            j = self._json('POST', API + '/api/auth/device-login',
+                           json={'device_id': self._device_id}, timeout=15)
+            uid = (j.get('data') or {}).get('user_id')
+            if not uid:
+                raise RuntimeError('device-login 无 user_id: %s' % str(j)[:120])
+            self._uid = uid
         return self._uid
 
     # ==================== 275 官方书单接口 ====================
     def _api275(self, path, timeout=10):
-        r = N.get(self.base + path, timeout=timeout, headers={'User-Agent': UA})
-        r.raise_for_status()
-        return r.json()
+        return self._json('GET', self.base + path,
+                          headers={'User-Agent': UA}, timeout=timeout)
 
     def _item(self, x):
         return {
@@ -214,9 +249,8 @@ class Spider(A):
 
     # ==================== 拾音盘接口 ====================
     def _tySearch(self, keyword):
-        r = self._app.get(TY + '/search', params={'keyword': keyword}, timeout=15)
-        r.raise_for_status()
-        items = (r.json().get('data') or {}).get('items') or []
+        j = self._json('GET', TY + '/search', params={'keyword': keyword}, timeout=15)
+        items = (j.get('data') or {}).get('items') or []
         added = False
         for it in items:
             if it.get('id'):
@@ -243,16 +277,72 @@ class Spider(A):
     def _albumMeta(self, uid, ty_id):
         """查用户歌单拿专辑元数据 (title/cover), 拿不到返回 {}"""
         try:
-            r = self._app.get(API + '/api/users/%d/albums' % uid, timeout=15).json()
-            for a in r.get('data') or []:
+            j = self._json('GET', API + '/api/users/%d/albums' % uid, timeout=15)
+            for a in j.get('data') or []:
                 if str(a.get('external_id')) == str(ty_id):
                     return a
         except Exception as e:
-            LOG('用户歌单查询失败: %s' % e)
+            LOG('用户歌单查询失败(忽略): %s' % e)
         return {}
 
+    def _doImport(self, uid, ty_id, rounds=2):
+        """提交提取任务并轮询; 轮询单次异常不中断, 失败再提交一轮. 返回 plat id 或 None"""
+        for _ in range(rounds):
+            try:
+                j = self._json('POST', TY + '/import',
+                               json={'user_id': uid, 'album_id': ty_id}, timeout=30)
+                task = (j.get('data') or {}).get('task_id')
+            except Exception as e:
+                LOG('提取提交异常(重试): %s' % e)
+                time.sleep(1)
+                continue
+            if not task:
+                LOG('提取任务无 task_id: %s' % str(j)[:120])
+                time.sleep(1)
+                continue
+            deadline = time.time() + 20      # 服务端冷门书抓取上限
+            plat, failed = None, False
+            while time.time() < deadline:
+                try:
+                    st = (self._json('GET', TY + '/import/status',
+                                     params={'task_id': task}, timeout=10).get('data')) or {}
+                except Exception as e:
+                    LOG('状态轮询异常(继续等): %s' % e)  # 抖动不中断提取
+                    time.sleep(1)
+                    continue
+                if st.get('status') == 'done':
+                    plat = st.get('album_id')
+                    break
+                if st.get('status') == 'failed':
+                    failed = True
+                    break
+                time.sleep(0.5)               # 先查后睡: 热门书克隆缓存常秒回
+            if plat:
+                return plat
+            LOG('提取%s (task=%s)' % ('失败' if failed else '超时', task))
+            time.sleep(1)
+        return None
+
+    def _getTracks(self, plat, uid, tries=3):
+        """拉曲目列表: 瞬时异常/空列表都重试 (服务端 status=done 后曲目可能还没就绪)"""
+        tracks = []
+        for i in range(tries):
+            try:
+                j = self._json('GET', API + '/api/albums/%s/tracks' % plat,
+                               params={'user_id': uid}, timeout=20)
+                tracks = j.get('data') or []
+                if not isinstance(tracks, list):
+                    tracks = tracks.get('tracks') or tracks.get('list') or []
+            except Exception as e:
+                tracks = []
+                LOG('曲目获取异常: %s' % e)
+            if tracks:
+                return tracks
+            time.sleep(0.8)
+        return []
+
     def _ensureAlbum(self, ty_id, _retried=False):
-        """返回 {platform_id, title, cover, desc, teller, tracks}, 带缓存"""
+        """返回 {platform_id, title, cover, desc, teller, count, tracks}, 带缓存"""
         ty_id = str(ty_id)
         if ty_id in self._info_cache:
             return self._info_cache[ty_id]
@@ -262,35 +352,19 @@ class Spider(A):
         if plat is None:                   # 兜底: 从歌单里找 (老缓存/别处提取的)
             meta = self._albumMeta(uid, ty_id)
             plat = meta.get('id')
-        if plat is None:                   # 提交提取任务
-            r = self._app.post(TY + '/import', json={'user_id': uid, 'album_id': ty_id},
-                               timeout=30)
-            task = (r.json().get('data') or {}).get('task_id')
-            for i in range(30):            # 先查后睡: 热门书克隆缓存常秒回
-                st = self._app.get(TY + '/import/status', params={'task_id': task},
-                                   timeout=15).json().get('data') or {}
-                if st.get('status') == 'done':
-                    plat = st.get('album_id')
-                    break
-                if st.get('status') == 'failed':
-                    break
-                time.sleep(0.4 if i < 8 else 1)
+        if plat is None:                   # 提交提取任务 (内部自带重试)
+            plat = self._doImport(uid, ty_id)
             if plat is None:
                 raise RuntimeError('提取未完成, 稍后重试')
             self._plat_map[ty_id] = plat
             self._saveDisk()
         if not meta and ty_id not in self._ty_meta:
             meta = self._albumMeta(uid, ty_id)  # 仅缺元数据时才回查 (历史记录直开)
-        r = self._app.get(API + '/api/albums/%s/tracks' % plat, params={'user_id': uid},
-                          timeout=20).json()
-        tracks = r.get('data') or []
-        if not isinstance(tracks, list):
-            tracks = tracks.get('tracks') or tracks.get('list') or []
+        tracks = self._getTracks(plat, uid)
         if not tracks and not _retried:
             # 盘缓存的 plat 失效 (服务端重建歌单等): 重置缓存重新提取一次
             LOG('曲目为空, 重置提取缓存重试: %s' % ty_id)
             self._plat_map.pop(ty_id, None)
-            self._info_cache.pop(ty_id, None)
             self._saveDisk()
             return self._ensureAlbum(ty_id, _retried=True)
         cached = self._ty_meta.get(ty_id) or {}
@@ -300,6 +374,7 @@ class Spider(A):
             'cover': meta.get('cover_url') or cached.get('cover_url') or '',
             'desc': meta.get('description') or cached.get('description') or '',
             'teller': cached.get('teller') or '',
+            'count': int(meta.get('count') or cached.get('count') or 0),
             'tracks': tracks,
         }
         if tracks:  # 空曲目不落缓存 (服务端还没抓好时, 下次进来还能再试)
@@ -360,35 +435,56 @@ class Spider(A):
             LOG('categoryContent 失败: %s' % e)
         return S
 
+    @staticmethod
+    def _buildVod(raw, info):
+        """tracks 可用时用真实标题; 拿不到时按元数据集数合成选集 (详情页永不出空)"""
+        ty_id = info['ty_id']
+        tracks = info.get('tracks') or []
+        eps = []
+        if tracks:
+            for i, t in enumerate(tracks):
+                idx = t.get('track_no') or i + 1
+                eps.append('%s$%s|%s' % (t.get('title') or ('第%d集' % idx), ty_id, idx))
+        else:
+            count = int(info.get('count') or 0)
+            if count <= 0:
+                return None
+            LOG('曲目列表不可用, 按集数合成选集兜底: %s x%d' % (ty_id, count))
+            eps = ['第%d集$%s|%d' % (n, ty_id, n) for n in range(1, count + 1)]
+        return {
+            'vod_id': raw,
+            'vod_name': info.get('title') or '',
+            'vod_pic': info.get('cover') or '',
+            'vod_remarks': info.get('teller') or '',
+            'vod_content': info.get('desc') or '',
+            'vod_play_from': PLAY_FLAG,
+            'vod_play_url': '#'.join(eps),
+        }
+
     def detailContent(self, did):
         raw = str(did[0]).strip()
         S = {'list': [], 'parse': 0, 'jx': 0}
         t0 = time.time()
-        try:
-            self._boot()
-            if raw.startswith('ty_'):
-                info = self._ensureAlbum(raw[3:])
-            else:
-                info = self._bookToAlbum(raw.replace('275_', ''))
-            if not info or not info.get('tracks'):
+        for attempt in (1, 2):  # 整体重试一轮: 瞬时失败时第一轮往往已把各环节缓存焐热
+            info, vod = None, None
+            try:
+                self._boot()
+                if raw.startswith('ty_'):
+                    info = self._ensureAlbum(raw[3:])
+                else:
+                    info = self._bookToAlbum(raw.replace('275_', ''))
+                if info:
+                    vod = self._buildVod(raw, info)
+            except Exception as e:
+                LOG('detailContent 异常(第%d次) [%s]: %s' % (attempt, raw, e))
+            if vod:
+                S['list'].append(vod)
+                LOG('detail %s: %d集 %.2fs (第%d次)'
+                    % (raw, vod['vod_play_url'].count('#') + 1, time.time() - t0, attempt))
                 return S
-            eps = []
-            for i, t in enumerate(info['tracks']):
-                idx = t.get('track_no') or i + 1
-                eps.append('%s$%s|%s' % (t.get('title') or ('第%d集' % idx),
-                                         info['ty_id'], idx))
-            S['list'].append({
-                'vod_id': raw,
-                'vod_name': info['title'],
-                'vod_pic': info['cover'],
-                'vod_remarks': info['teller'],
-                'vod_content': info['desc'],
-                'vod_play_from': PLAY_FLAG,
-                'vod_play_url': '#'.join(eps),
-            })
-            LOG('detail %s: %d集 %.2fs' % (raw, len(eps), time.time() - t0))
-        except Exception as e:
-            LOG('detailContent 失败 [%s] %.2fs: %s' % (raw, time.time() - t0, e))
+            if attempt < 2:
+                time.sleep(0.8)
+        LOG('detailContent 失败 [%s] %.2fs' % (raw, time.time() - t0))
         return S
 
     def searchContent(self, key, quick, page='1'):
@@ -410,21 +506,17 @@ class Spider(A):
         return S
 
     def playerContent(self, flag, pid, vipFlags):
+        # 直链由 album+idx 规则拼出, 不做探活: 探活请求一旦抖动就返回空 url,
+        # 播放器必然报"暂无播放数据" —— 交给播放器自己拉流即可
         S = {'parse': 0, 'jx': 0, 'playUrl': '', 'url': '', 'header': {'User-Agent': APP_UA}}
         try:
-            self._boot()
             ty_id, idx = str(pid).split('|', 1)
-            url = '%s/tingyou/stream?album=%s&idx=%s' % (API, ty_id, idx)
-            r = self._app.get(url, stream=True, timeout=15)
-            ct = r.headers.get('Content-Type') or ''
-            ok = r.status_code in (200, 206) and 'json' not in ct
-            r.close()
-            if ok:
-                S['url'] = url
+            if ty_id and str(idx).isdigit():
+                S['url'] = '%s/tingyou/stream?album=%s&idx=%s' % (API, ty_id, idx)
             else:
-                LOG('playerContent 校验失败 http=%s ct=%s' % (r.status_code, ct))
+                LOG('playerContent 参数异常: %s' % pid)
         except Exception as e:
-            LOG('playerContent 失败 [%s]: %s' % (pid, e))
+            LOG('playerContent 参数异常 [%s]: %s' % (pid, e))
         return S
 
     def localProxy(self, params):
