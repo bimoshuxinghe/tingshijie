@@ -268,8 +268,8 @@ class Spider(A):
     def _base(self):
         return getattr(self, 'BASE', None) or BASE
 
-    # ---- 网络: 重试 + 退避 ----
-    def _req(self, url, tries=3, timeout=15):
+    # ---- 网络: 重试 + 退避 (站点限流 5次/5秒, 见响应头 x-rate-limit-limit) ----
+    def _req(self, url, tries=4, timeout=15):
         last = None
         for i in range(tries):
             try:
@@ -279,6 +279,11 @@ class Spider(A):
                 if r.status_code == 200 and r.text:
                     return r.text
                 last = Exception('HTTP %s %s' % (r.status_code, url))
+                if r.status_code == 429:
+                    # 撞限流: 快速重试仍在 5s 窗口内会连续 429, 等窗口滑出再拉,
+                    # 否则翻页拿到空列表 app 会误判为"没有下一页"
+                    time.sleep(5.2)
+                    continue
             except Exception as e:
                 last = e
             time.sleep(0.3 * (i + 1))
@@ -299,7 +304,7 @@ class Spider(A):
             if not mt:
                 continue
             name = mt.group(1).strip()
-            mp = re.search(r"<img src='([^']+)'", chunk)
+            mp = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', chunk)
             pic = mp.group(1) if mp else ''
             if pic.startswith('/'):
                 pic = self._base() + pic
@@ -360,13 +365,22 @@ class Spider(A):
             return {'list': []}
 
     def categoryContent(self, cid, page, filter, ext):
-        url = '%s/book/%s/%s' % (self._base(), cid, page)
+        try:
+            pg = int(page or 1)
+        except Exception:
+            pg = 1
+        if pg < 1:
+            pg = 1
+        S = {'page': pg, 'pagecount': pg, 'limit': 10, 'total': 0,
+             'list': [], 'parse': 0, 'jx': 0}
+        url = '%s/book/%s/%s' % (self._base(), cid, pg)
         try:
             html = self._req(url)
         except Exception as e:
             LOG('category fail %s: %s' % (cid, e))
-            return {'page': page, 'pagecount': 1, 'limit': 10, 'total': 0, 'list': []}
+            return S                          # pagecount==page => 无下一页, 停止翻页
         cards = self._parseCards(html)
+        S['list'] = [self._buildVod(c) for c in cards]
         total = 0
         try:
             m = re.search(r'共(\d+)条', html)
@@ -374,26 +388,53 @@ class Spider(A):
                 total = int(m.group(1))
         except Exception:
             pass
-        pagecount = max(1, (total + 9) // 10) if total else int(page)
-        if not total and len(cards) >= 10:
-            pagecount = int(page) + 1
-        return {'page': int(page), 'pagecount': pagecount, 'limit': 10,
-                'total': total, 'list': [self._buildVod(c) for c in cards]}
+        if total:
+            # 站点给了总数: 页数精确可算; 本页满 10 条时确保 pagecount>page,
+            # 让 app 判定"还有下一页"继续上滑加载
+            S['total'] = total
+            S['pagecount'] = max((total + 9) // 10, pg + 1 if len(cards) >= 10 else pg)
+        elif len(cards) >= 10:
+            S['pagecount'] = pg + 1           # 满页 => 下一页待拉
+            S['total'] = (pg + 1) * 10
+        else:
+            S['total'] = (pg - 1) * 10 + len(cards)
+        return S
 
     def searchContent(self, key, quick, page='1'):
         from urllib.parse import quote
+        try:
+            pg = int(page or 1)
+        except Exception:
+            pg = 1
+        if pg < 1:
+            pg = 1
+        S = {'page': pg, 'pagecount': pg, 'limit': 10, 'total': 0,
+             'list': [], 'parse': 0, 'jx': 0}
         url = '%s/search?type=1&name=%s&pageIndex=%s' % (
-            self._base(), quote(str(key)), page)
+            self._base(), quote(str(key)), pg)
         try:
             html = self._req(url)
         except Exception as e:
             LOG('search fail: %s' % e)
-            return {'page': int(page), 'pagecount': int(page), 'limit': 10,
-                    'total': 0, 'list': []}
+            return S
         cards = self._parseCards(html)
-        pagecount = int(page) + 1 if len(cards) >= 10 else int(page)
-        return {'page': int(page), 'pagecount': pagecount, 'limit': 10,
-                'total': len(cards), 'list': [self._buildVod(c) for c in cards]}
+        S['list'] = [self._buildVod(c) for c in cards]
+        total = 0
+        try:
+            m = re.search(r'共(\d+)条', html)
+            if m:
+                total = int(m.group(1))
+        except Exception:
+            pass
+        if total:
+            S['total'] = total
+            S['pagecount'] = max((total + 9) // 10, pg + 1 if len(cards) >= 10 else pg)
+        elif len(cards) >= 10:
+            S['pagecount'] = pg + 1           # 满页 => 还有下一页
+            S['total'] = (pg + 1) * 10
+        else:
+            S['total'] = (pg - 1) * 10 + len(cards)
+        return S
 
     # ---- 详情: 元数据 + 全量选集 (按 200/页并行拉取) ----
     def _detailMeta(self, html, uid):
