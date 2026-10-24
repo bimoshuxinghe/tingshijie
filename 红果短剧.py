@@ -4080,13 +4080,40 @@ def _filter_group(key, name, values):
     return {"key": key, "name": name, "value": [{"n": n, "v": v} for n, v in values]}
 
 
+def _suggestion_cards(key: str) -> list:
+    """官网剧名联想接口（/api/search/suggestion）：数据源为剧库，新剧即时收录；
+    搜索接口的索引对短词召回不全（实测搜"反派拿捏"仅召回第一二季，联想能带出刚上线的第三季）。
+    仅取 word_type=short_play_name 且带 video_data.series_id 的真实剧集。"""
+    try:
+        r = requests.get(
+            SITE + "/api/search/suggestion",
+            params={"aid": "8662", "query": str(key)},
+            headers={
+                "User-Agent": UA,
+                "Accept": "application/json",
+                "Accept-Language": "zh-CN,zh;q=0.9",
+                "Referer": SITE + "/search/" + quote(str(key), safe=""),
+            },
+            timeout=15,
+        )
+        if r.status_code == 200:
+            data = r.json()
+            return [x for x in (data.get("suggestionList") or [])
+                    if x.get("word_type") == "short_play_name" and (x.get("video_data") or {}).get("series_id")]
+    except Exception:
+        pass
+    return []
+
+
 def _search_loader(key: str, page: int = 1) -> dict:
     """拉取搜索数据，失败重试。
 
     2026-10 官网搜索页改为纯客户端渲染（CSR），SSR 的 _ROUTER_DATA 不再包含
     searchList，页面实际调用免签名 JSON 接口 /api/search/result（与前端 XHR
     一致，返回 searchList/totalCount/totalPages/hasMore），这里优先走该接口；
-    失败再回退旧版 SSR 路径以防官网未来恢复 SSR。"""
+    失败再回退旧版 SSR 路径以防官网未来恢复 SSR。
+    上游偶发不可用时该接口返回 HTTP 200 + {"code":"upstream_unavailable"} 的
+    假空结果，须重试/兜底而非当作无结果。"""
     last = {}
     key = str(key or "").strip()
     if not key:
@@ -4106,12 +4133,30 @@ def _search_loader(key: str, page: int = 1) -> dict:
             )
             if r.status_code == 200:
                 data = r.json()
+                if data.get("code") == "upstream_unavailable":
+                    try:
+                        time.sleep(0.5 * (attempt + 1))
+                    except Exception:
+                        pass
+                    continue
                 page_data = {
                     "searchList": data.get("searchList") or [],
                     "totalCount": data.get("totalCount") or 0,
                     "totalPages": data.get("totalPages") or 1,
                 }
                 if page_data["searchList"]:
+                    if int(page) <= 1:
+                        # 合并剧名联想（新剧即时收录，短词召回更全），按 series_id 去重后前置
+                        seen = set()
+                        merged = []
+                        for x in _suggestion_cards(key) + page_data["searchList"]:
+                            sid = str((x.get("video_data") or {}).get("series_id") or x.get("series_id") or "")
+                            if sid and sid in seen:
+                                continue
+                            if sid:
+                                seen.add(sid)
+                            merged.append(x)
+                        page_data["searchList"] = merged
                     return page_data
                 last = page_data or last
         except Exception:
